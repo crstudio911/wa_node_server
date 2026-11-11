@@ -13,8 +13,13 @@ const {
   makeCacheableSignalKeyStore
 } = require('@whiskeysockets/baileys');
 
-const PORT = Number(process.env.PORT) || 3000;
-const KEY = String(process.env.BRIDGE_KEY || '');
+const SETTINGS = {
+  BRIDGE_KEY: 'wA!9x_kP$7mQ#vL2*zR#8bN$4fY@6hC%1jT',
+  WORKER_URL: 'https://pop-api-1.uuuuouuuuuuouuu.workers.dev'
+};
+
+const PORT = Number(process.env.SERVER_PORT) || Number(process.env.PORT) || 3000;
+const KEY = String(process.env.BRIDGE_KEY || SETTINGS.BRIDGE_KEY || '');
 const MAX_CLIENTS = Number(process.env.MAX_CLIENTS) || 10;
 const IDLE_MS = 15 * 60 * 1000;
 const KEEP_MS = 60 * 60 * 1000;
@@ -34,12 +39,19 @@ const BROWSER = ['POP', 'Chrome', '1.0.0'];
 
 const logger = pino({ level: 'silent' });
 const encKey = crypto.createHash('sha256').update('pop-wa:' + KEY).digest();
+const linkKey = crypto.createHash('sha256').update('pop-link:' + KEY).digest();
+const LINK_SKEW_MS = 60 * 1000;
+const nonces = new Map();
+const NONCE_RE = /^[0-9a-f]{32}$/;
+const PACK_RE = /^[A-Za-z0-9+/]+={0,2}$/;
 const clients = new Map();
-const workerUrl = String(process.env.WORKER_URL || '').replace(/\/+$/, '');
+const workerUrl = String(process.env.WORKER_URL || SETTINGS.WORKER_URL || '').replace(/\/+$/, '');
 const pending = new Map();
+const dropQueue = new Set();
+const LOG_MAX = 400;
 
 if (KEY.length < 32 || !/^https:\/\/[A-Za-z0-9.-]+$/.test(workerUrl)) {
-  console.error('BRIDGE_KEY (32+ chars) and WORKER_URL (https) are required');
+  console.error('Set BRIDGE_KEY (32+ chars) and WORKER_URL (https) in SETTINGS at the top of index.js');
   process.exit(1);
 }
 let version = null;
@@ -49,6 +61,24 @@ function safeEqual(a, b) {
   const x = Buffer.from(String(a));
   const y = Buffer.from(String(b));
   return x.length === y.length && crypto.timingSafeEqual(x, y);
+}
+
+function lock(obj, aad) {
+  const iv = crypto.randomBytes(12);
+  const c = crypto.createCipheriv('aes-256-gcm', linkKey, iv);
+  c.setAAD(Buffer.from(aad));
+  const ct = Buffer.concat([c.update(Buffer.from(JSON.stringify(obj))), c.final()]);
+  return Buffer.concat([iv, ct, c.getAuthTag()]).toString('base64');
+}
+
+function unlock(text, aad) {
+  const b = Buffer.from(text, 'base64');
+  if (b.length < 29) throw new Error('bad');
+  const d = crypto.createDecipheriv('aes-256-gcm', linkKey, b.subarray(0, 12));
+  d.setAAD(Buffer.from(aad));
+  d.setAuthTag(b.subarray(b.length - 16));
+  const raw = Buffer.concat([d.update(b.subarray(12, b.length - 16)), d.final()]);
+  return JSON.parse(raw.toString());
 }
 
 function seal(obj) {
@@ -151,13 +181,35 @@ function getClient(uid) {
       saving: null,
       retries: 0,
       manual: false,
-      error: null
+      error: null,
+      log: [],
+      logSeq: 0
     };
     clients.set(uid, c);
   }
   c.seen = Date.now();
   pending.delete(uid);
   return c;
+}
+
+function note(c, k, p, x) {
+  if (!c) return;
+  c.logSeq++;
+  c.log.push({ n: c.logSeq, t: Date.now(), k, p: p || null, x: x === undefined ? null : x });
+  if (c.log.length > LOG_MAX) c.log.splice(0, c.log.length - LOG_MAX);
+}
+
+async function dropSaved(uid) {
+  try {
+    await worker('/bridge/session/del', { uid });
+    const r = await worker('/bridge/session/get', { uid });
+    if (r.found) throw new Error('left');
+    dropQueue.delete(uid);
+    return true;
+  } catch (e) {
+    dropQueue.add(uid);
+    return false;
+  }
 }
 
 function active(c) {
@@ -177,6 +229,7 @@ async function touch(c, at) {
     if (r.expired || r.found === false) {
       if (clients.get(c.uid) === c && !busy(c) && Date.now() - c.activeAt >= KEEP_MS) {
         c.error = 'expired';
+        note(c, 'expired');
         await wipe(c, true);
       }
       return;
@@ -245,7 +298,8 @@ async function wipe(c, logout) {
   c.expiresAt = 0;
   c.qrCount = 0;
   if (c.saving) await c.saving.catch(() => {});
-  await worker('/bridge/session/del', { uid: c.uid }).catch(() => {});
+  const gone = await dropSaved(c.uid);
+  note(c, gone ? 'wiped' : 'wipe_retry');
 }
 
 async function logoutSaved(saved) {
@@ -314,6 +368,7 @@ async function openSocket(c) {
       if (c.qrCount > QR_LIMIT) {
         c.manual = true;
         c.error = 'qr_timeout';
+        note(c, 'qr_timeout');
         c.sock = null;
         c.auth = null;
         c.state = 'idle';
@@ -325,7 +380,10 @@ async function openSocket(c) {
       }
       try {
         c.qr = await QRCode.toDataURL(u.qr, { margin: 1, width: 300, errorCorrectionLevel: 'M' });
-        if (c.sock === sock) c.state = 'qr';
+        if (c.sock === sock) {
+          c.state = 'qr';
+          note(c, 'qr', null, c.qrCount);
+        }
       } catch (e) {}
     }
     if (u.connection === 'open') {
@@ -335,6 +393,7 @@ async function openSocket(c) {
       c.retries = 0;
       c.error = null;
       c.phone = String((sock.user && sock.user.id) || '').split(':')[0].split('@')[0] || null;
+      note(c, 'open', c.phone);
       await save(c);
     }
     if (u.connection === 'close') {
@@ -347,18 +406,21 @@ async function openSocket(c) {
       }
       if (code === DisconnectReason.loggedOut) {
         c.error = 'logged_out';
+        note(c, 'logged_out');
         await wipe(c, false);
         return;
       }
       if (c.retries < MAX_RETRIES && c.auth) {
         c.retries++;
         c.state = 'connecting';
+        note(c, 'reconnect', null, c.retries);
         setTimeout(() => {
           if (!c.sock && c.auth && clients.get(c.uid) === c && !c.manual) openSocket(c).catch(() => {});
         }, Math.min(2000 * c.retries, 10000));
       } else {
         c.state = 'idle';
         c.error = 'failed';
+        note(c, 'conn_failed');
       }
     }
   });
@@ -377,14 +439,18 @@ async function start(c, mode) {
       try {
         saved = unseal(r.data);
       } catch (e) {
-        await worker('/bridge/session/del', { uid: c.uid }).catch(() => {});
+        await dropSaved(c.uid);
       }
       if (saved && r.expired) {
         c.error = 'expired';
         logoutSaved(saved).catch(() => {});
+        const gone = await dropSaved(c.uid);
+        note(c, 'expired');
+        note(c, gone ? 'wiped' : 'wipe_retry');
       } else if (saved) {
         c.auth = makeAuth(saved, () => saveSoon(c));
         c.expiresAt = Number(r.expiresAt) || 0;
+        note(c, 'resume');
       }
     }
     if (!c.auth) {
@@ -435,11 +501,13 @@ async function runJob(c, job, input) {
     active(c);
     if (!(await ready(c, job))) {
       if (job.stop) break;
+      note(c, 'lost');
       for (let k = i; k < input.rows.length; k++) push(job, k, 'f');
       return;
     }
     const row = input.rows[i];
     let status = 'f';
+    let why = null;
     try {
       const hits = await c.sock.onWhatsApp(row.p);
       const hit = hits && hits[0];
@@ -450,10 +518,25 @@ async function runJob(c, job, input) {
       }
     } catch (e) {
       status = 'f';
+      why = reason(e);
     }
     push(job, i, status);
-    if (i < input.rows.length - 1 && !job.stop) await wait(job, range[0] + Math.floor(Math.random() * (range[1] - range[0])));
+    note(c, status === 's' ? 'sent' : status === 'n' ? 'not_wa' : 'failed', row.p, why);
+    if (i < input.rows.length - 1 && !job.stop) {
+      const ms = range[0] + Math.floor(Math.random() * (range[1] - range[0]));
+      note(c, 'wait', null, Math.round(ms / 1000));
+      await wait(job, ms);
+    }
   }
+}
+
+function reason(e) {
+  const code = e && e.output ? e.output.statusCode : 0;
+  const m = String((e && e.message) || '').toLowerCase();
+  if (code === 429 || m.includes('rate')) return 'rate';
+  if (m.includes('timed out') || m.includes('timeout')) return 'timeout';
+  if (m.includes('closed') || m.includes('connection')) return 'conn';
+  return 'other';
 }
 
 function push(job, i, status) {
@@ -478,7 +561,7 @@ function cleanInput(b) {
   return { template, defs, rows: rows.map((r) => ({ p: r.p, v: r.v })), speed: b.speed === 'normal' ? 'normal' : 'safe' };
 }
 
-function view(c, from) {
+function view(c, from, lf) {
   const j = c && c.job;
   return {
     ok: true,
@@ -486,6 +569,8 @@ function view(c, from) {
     qr: c && c.state === 'qr' ? c.qr : null,
     phone: c && c.state === 'open' ? c.phone : null,
     error: c ? c.error : null,
+    logSeq: c ? c.logSeq : 0,
+    log: c ? c.log.filter((e) => e.n > (Number(lf) || 0)) : [],
     job: j
       ? {
           id: j.id,
@@ -515,7 +600,7 @@ async function expirePending(uid) {
         logoutSaved(unseal(r.data)).catch(() => {});
       } catch (e) {}
     }
-    await worker('/bridge/session/del', { uid });
+    await dropSaved(uid);
   } catch (e) {
     pending.set(uid, Date.now() + 60000);
   }
@@ -523,6 +608,7 @@ async function expirePending(uid) {
 
 setInterval(() => {
   const now = Date.now();
+  for (const uid of dropQueue) dropSaved(uid).catch(() => {});
   for (const [uid, at] of pending) {
     if (now >= at && !clients.has(uid)) expirePending(uid).catch(() => {});
   }
@@ -550,6 +636,7 @@ setInterval(() => {
     }
     if (linked && now - c.activeAt >= KEEP_MS) {
       c.error = 'expired';
+      note(c, 'expired');
       wipe(c, true).catch(() => {});
       continue;
     }
@@ -575,31 +662,64 @@ setInterval(() => {
   }
 }, 30000).unref();
 
+setInterval(() => {
+  const now = Date.now();
+  for (const [n, at] of nonces) if (now - at > LINK_SKEW_MS * 2) nonces.delete(n);
+}, 30000).unref();
+
+const ROUTES = new Set(['/status', '/connect', '/send', '/stop', '/logout']);
+
+function deny(req, res) {
+  req.socket.destroy();
+}
+
 const app = express();
 app.disable('x-powered-by');
-app.set('trust proxy', 1);
+app.disable('etag');
+app.set('trust proxy', false);
+
 app.use((req, res, next) => {
+  if (req.method !== 'POST' || !ROUTES.has(req.path) || Object.keys(req.query).length) return deny(req, res);
+  const type = String(req.get('content-type') || '').toLowerCase();
+  if (!type.startsWith('application/json')) return deny(req, res);
+  const t = Number(req.get('x-link-time'));
+  const n = String(req.get('x-link-nonce') || '');
+  if (!Number.isFinite(t) || Math.abs(Date.now() - t) > LINK_SKEW_MS || !NONCE_RE.test(n) || nonces.has(n)) return deny(req, res);
+  req.linkTime = t;
+  req.linkNonce = n;
   res.set('Cache-Control', 'no-store');
   res.set('X-Content-Type-Options', 'nosniff');
   next();
 });
-app.use(express.json({ limit: '1mb' }));
 
-app.get('/', (req, res) => {
-  res.json({ ok: true });
+app.use(express.json({ limit: '1mb', strict: true }));
+
+app.use((err, req, res, next) => {
+  deny(req, res);
 });
 
 app.use((req, res, next) => {
-  if (!safeEqual(req.get('x-bridge-key') || '', KEY)) return res.status(403).json({ ok: false, error: 'forbidden' });
-  const uid = req.body && req.body.uid;
-  if (typeof uid !== 'string' || !UID_RE.test(uid)) return res.status(400).json({ ok: false, error: 'bad' });
+  const pack = req.body && req.body.d;
+  if (typeof pack !== 'string' || !PACK_RE.test(pack)) return deny(req, res);
+  let body;
+  try {
+    body = unlock(pack, req.path + '.' + req.linkTime + '.' + req.linkNonce);
+  } catch (e) {
+    return deny(req, res);
+  }
+  if (!body || typeof body !== 'object' || typeof body.uid !== 'string' || !UID_RE.test(body.uid)) return deny(req, res);
+  nonces.set(req.linkNonce, Date.now());
+  req.body = body;
+  const aad = 'res.' + req.linkNonce;
+  const send = res.json.bind(res);
+  res.json = (obj) => send({ d: lock(obj, aad) });
   next();
 });
 
 app.post('/status', (req, res) => {
   const c = clients.get(req.body.uid);
   if (c) active(c);
-  res.json(view(c, req.body.from));
+  res.json(view(c, req.body.from, req.body.lf));
 });
 
 app.post('/connect', async (req, res) => {
@@ -616,7 +736,7 @@ app.post('/connect', async (req, res) => {
     c.error = null;
     return res.status(503).json({ ok: false, error: 'busy' });
   }
-  res.json(view(c, 0));
+  res.json(view(c, 0, req.body.lf));
 });
 
 app.post('/send', (req, res) => {
@@ -638,18 +758,23 @@ app.post('/send', (req, res) => {
     stop: false
   };
   c.job = job;
+  note(c, 'start', null, job.total);
   runJob(c, job, input)
     .catch(() => {})
     .finally(() => {
       job.running = false;
+      note(c, job.stop ? 'stopped' : 'done', null, [job.sent, job.invalid, job.failed]);
     });
-  res.json(view(c, 0));
+  res.json(view(c, 0, req.body.lf));
 });
 
 app.post('/stop', (req, res) => {
   const c = clients.get(req.body.uid);
-  if (c && c.job && c.job.running) c.job.stop = true;
-  res.json(view(c, req.body.from));
+  if (c && c.job && c.job.running && !c.job.stop) {
+    c.job.stop = true;
+    note(c, 'stopping');
+  }
+  res.json(view(c, req.body.from, req.body.lf));
 });
 
 app.post('/logout', async (req, res) => {
@@ -664,19 +789,28 @@ app.post('/logout', async (req, res) => {
           logoutSaved(unseal(r.data)).catch(() => {});
         } catch (e) {}
       }
-      await worker('/bridge/session/del', { uid: c.uid });
+      const gone = await dropSaved(c.uid);
+      note(c, gone ? 'wiped' : 'wipe_retry');
     }
   } catch (e) {
     return res.status(502).json({ ok: false, error: 'unavailable' });
   }
   c.error = null;
-  res.json(view(c, 0));
+  res.json(view(c, 0, req.body.lf));
 });
 
 app.use((req, res) => {
-  res.status(404).json({ ok: false, error: 'not_found' });
+  deny(req, res);
 });
 
-app.listen(PORT, () => {
-  console.log('POP bridge on ' + PORT);
+const server = app.listen(PORT, '0.0.0.0', () => {
+  console.log('POP bridge ready on port ' + PORT);
+});
+server.headersTimeout = 15000;
+server.requestTimeout = 30000;
+server.keepAliveTimeout = 5000;
+
+process.on('unhandledRejection', () => {});
+process.on('uncaughtException', (e) => {
+  console.error('error', e && e.message);
 });
