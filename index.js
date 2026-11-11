@@ -1,3 +1,4 @@
+console.log('=== UPDATE APPLIED SUCCESSFULLY V10 ===');
 const crypto = require('crypto');
 const zlib = require('zlib');
 const express = require('express');
