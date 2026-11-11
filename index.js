@@ -1,4 +1,3 @@
-console.log('=== UPDATE APPLIED SUCCESSFULLY V10 ===');
 const crypto = require('crypto');
 const zlib = require('zlib');
 const express = require('express');
@@ -29,13 +28,34 @@ const TOUCH_MS = 2 * 60 * 1000;
 const QR_IDLE_MS = 2 * 60 * 1000;
 const QR_LIMIT = 5;
 const MAX_RETRIES = 6;
+const BACKOFF_MAX = 60 * 1000;
+const PAUSE_MS = 30 * 60 * 1000;
 const MAX_ROWS = 500;
 const MAX_TEXT = 4096;
 const MAX_VALUE = 300;
 const UID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const PHONE_RE = /^\d{8,15}$/;
-const SPEEDS = { safe: [8000, 15000], normal: [4000, 8000] };
-const SKIP = new Set(['session', 'sender-key', 'sender-key-memory']);
+const SPEEDS = { safe: [30000, 65000], normal: [18000, 40000] };
+const HOUR_CAPS = { safe: 30, normal: 45 };
+const DAY_CAP = 150;
+const REST_EVERY = [8, 15];
+const REST_MS = [5 * 60 * 1000, 11 * 60 * 1000];
+const RATE_PAUSE_MS = 20 * 60 * 1000;
+const SETTLE_MS = 30 * 1000;
+const HOLD_MS = 45 * 60 * 1000;
+const WARM_COUNT = 5;
+const INVALID_STREAK = 6;
+const INVALID_REST = [3 * 60 * 1000, 6 * 60 * 1000];
+const INVALID_MIN = 20;
+const INVALID_RATIO = 0.6;
+const SENT_TTL = 48 * 3600 * 1000;
+const SENT_MAX = 800;
+const SAVE_FAST_MS = 3000;
+const SAVE_SLOW_MS = 90 * 1000;
+const SNAP_BUDGET = 340000;
+const SKIP = new Set(['sender-key', 'sender-key-memory']);
+const SLOW = new Set(['session']);
+const BLOCK_CODES = new Set([403, 463, 479]);
 const BROWSER = ['POP', 'Chrome', '1.0.0'];
 
 const logger = pino({ level: 'silent' });
@@ -50,6 +70,7 @@ const workerUrl = String(process.env.WORKER_URL || SETTINGS.WORKER_URL || '').re
 const pending = new Map();
 const dropQueue = new Set();
 const LOG_MAX = 400;
+const outbox = new Map();
 
 if (KEY.length < 32 || !/^https:\/\/[A-Za-z0-9.-]+$/.test(workerUrl)) {
   console.error('Set BRIDGE_KEY (32+ chars) and WORKER_URL (https) in SETTINGS at the top of index.js');
@@ -62,6 +83,64 @@ function safeEqual(a, b) {
   const x = Buffer.from(String(a));
   const y = Buffer.from(String(b));
   return x.length === y.length && crypto.timingSafeEqual(x, y);
+}
+
+function ttlCache(ms) {
+  const m = new Map();
+  return {
+    get: (k) => {
+      const e = m.get(k);
+      if (!e) return undefined;
+      if (Date.now() > e.t) {
+        m.delete(k);
+        return undefined;
+      }
+      return e.v;
+    },
+    set: (k, v) => {
+      if (m.size > 5000) m.clear();
+      m.set(k, { v, t: Date.now() + ms });
+    },
+    del: (k) => {
+      m.delete(k);
+    },
+    flushAll: () => {
+      m.clear();
+    }
+  };
+}
+
+function boxOf(uid) {
+  let b = outbox.get(uid);
+  if (!b) {
+    b = new Map();
+    outbox.set(uid, b);
+  }
+  return b;
+}
+
+function prune(b) {
+  const now = Date.now();
+  for (const [id, e] of b) if (now - e.t > SENT_TTL) b.delete(id);
+  while (b.size > SENT_MAX) b.delete(b.keys().next().value);
+}
+
+function remember(uid, sent) {
+  if (!sent || !sent.key || !sent.key.id || !sent.message) return;
+  const b = boxOf(uid);
+  b.set(sent.key.id, { t: Date.now(), m: Buffer.from(proto.Message.encode(sent.message).finish()) });
+  prune(b);
+}
+
+function recall(uid, id) {
+  const b = outbox.get(uid);
+  const e = b && b.get(id);
+  if (!e) return undefined;
+  try {
+    return proto.Message.decode(e.m);
+  } catch (x) {
+    return undefined;
+  }
 }
 
 function lock(obj, aad) {
@@ -104,7 +183,7 @@ async function worker(path, body) {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'X-Bridge-Key': KEY },
     body: JSON.stringify(body),
-    signal: AbortSignal.timeout(30000)
+    signal: AbortSignal.timeout(60000)
   });
   const j = await res.json().catch(() => null);
   if (!res.ok || !j || !j.ok) throw new Error((j && j.error) || 'worker');
@@ -146,20 +225,41 @@ function makeAuth(saved, onPersist) {
           if (v) keys[type][id] = v;
           else delete keys[type][id];
         }
-        if (!SKIP.has(type)) persist = true;
+        if (SLOW.has(type)) persist = persist || 'slow';
+        else if (!SKIP.has(type)) persist = 'fast';
       }
-      if (persist) onPersist();
+      if (persist) onPersist(persist === 'slow');
     }
   };
   return { creds, keys, store };
 }
 
-function snapshot(auth) {
+function snapshot(c, level) {
   const keys = {};
-  for (const type of Object.keys(auth.keys)) {
-    if (!SKIP.has(type)) keys[type] = auth.keys[type];
+  for (const type of Object.keys(c.auth.keys)) {
+    if (SKIP.has(type)) continue;
+    if (level >= 2 && SLOW.has(type)) continue;
+    keys[type] = c.auth.keys[type];
   }
-  return { creds: auth.creds, keys };
+  const out = [];
+  if (level < 1) {
+    const b = outbox.get(c.uid);
+    if (b) {
+      prune(b);
+      for (const [id, e] of b) out.push([id, e.t, e.m]);
+    }
+  }
+  return { creds: c.auth.creds, keys, out };
+}
+
+function restoreExtra(uid, saved) {
+  if (saved && Array.isArray(saved.out)) {
+    const b = boxOf(uid);
+    for (const e of saved.out) {
+      if (Array.isArray(e) && typeof e[0] === 'string' && Buffer.isBuffer(e[2]) && !b.has(e[0])) b.set(e[0], { t: Number(e[1]) || Date.now(), m: e[2] });
+    }
+    prune(b);
+  }
 }
 
 function getClient(uid) {
@@ -179,7 +279,10 @@ function getClient(uid) {
       activeAt: Date.now(),
       touchedAt: 0,
       saveTimer: null,
+      saveAt: 0,
       saving: null,
+      openAt: 0,
+      sentAt: 0,
       retries: 0,
       manual: false,
       error: null,
@@ -248,8 +351,14 @@ function liveCount() {
 async function save(c) {
   clearTimeout(c.saveTimer);
   c.saveTimer = null;
+  c.saveAt = 0;
   if (!c.auth || !c.auth.creds.me) return;
-  const data = seal(snapshot(c.auth));
+  let data = '';
+  for (let level = 0; level < 3; level++) {
+    data = seal(snapshot(c, level));
+    if (data.length <= SNAP_BUDGET) break;
+  }
+  if (data.length > SNAP_BUDGET) return;
   const run = worker('/bridge/session/put', { uid: c.uid, data });
   c.saving = run;
   try {
@@ -266,20 +375,25 @@ async function save(c) {
   }
 }
 
-function saveSoon(c) {
-  if (c.saveTimer || !c.auth || !c.auth.creds.me) return;
+function saveSoon(c, slow) {
+  if (!c.auth || !c.auth.creds.me) return;
+  const at = Date.now() + (slow ? SAVE_SLOW_MS : SAVE_FAST_MS);
+  if (c.saveTimer && c.saveAt <= at) return;
+  clearTimeout(c.saveTimer);
+  c.saveAt = at;
   c.saveTimer = setTimeout(() => {
     c.saveTimer = null;
+    c.saveAt = 0;
     save(c).catch(() => {});
-  }, 3000);
+  }, at - Date.now());
 }
 
-async function wipe(c, logout) {
+async function wipe(c, logout, keep) {
   c.manual = true;
   clearTimeout(c.saveTimer);
   c.saveTimer = null;
   pending.delete(c.uid);
-  if (c.job && c.job.running) c.job.stop = true;
+  if (!keep && c.job && c.job.running) c.job.stop = true;
   const sock = c.sock;
   c.sock = null;
   if (sock) {
@@ -298,6 +412,8 @@ async function wipe(c, logout) {
   c.phone = null;
   c.expiresAt = 0;
   c.qrCount = 0;
+  c.saveAt = 0;
+  outbox.delete(c.uid);
   if (c.saving) await c.saving.catch(() => {});
   const gone = await dropSaved(c.uid);
   note(c, gone ? 'wiped' : 'wipe_retry');
@@ -352,7 +468,18 @@ async function openSocket(c) {
     syncFullHistory: false,
     shouldSyncHistoryMessage: () => false,
     generateHighQualityLinkPreview: false,
-    connectTimeoutMs: 30000
+    connectTimeoutMs: 60000,
+    defaultQueryTimeoutMs: 90000,
+    keepAliveIntervalMs: 25000,
+    retryRequestDelayMs: 350,
+    maxMsgRetryCount: 5,
+    msgRetryCounterCache: c.retryCache || (c.retryCache = ttlCache(3600 * 1000)),
+    userDevicesCache: c.devCache || (c.devCache = ttlCache(5 * 60 * 1000)),
+    getMessage: async (key) => {
+      const m = key && key.id ? recall(c.uid, key.id) : undefined;
+      if (m) note(c, 'resent');
+      return m;
+    }
   });
   if (c.auth !== auth || c.sock) {
     try {
@@ -362,6 +489,18 @@ async function openSocket(c) {
   }
   c.sock = sock;
   sock.ev.on('creds.update', () => saveSoon(c));
+  sock.ev.on('messages.update', (list) => {
+    const j = c.job;
+    if (!j || !j.ids) return;
+    for (const u of list || []) {
+      const id = u && u.key && u.key.id;
+      const st = u && u.update ? Number(u.update.status) : 0;
+      if (id && st >= 3 && j.ids.has(id) && !j.got.has(id)) {
+        j.got.add(id);
+        j.delivered++;
+      }
+    }
+  });
   sock.ev.on('connection.update', async (u) => {
     if (c.sock !== sock) return;
     if (u.qr) {
@@ -393,6 +532,7 @@ async function openSocket(c) {
       c.qrCount = 0;
       c.retries = 0;
       c.error = null;
+      c.openAt = Date.now();
       c.phone = String((sock.user && sock.user.id) || '').split(':')[0].split('@')[0] || null;
       note(c, 'open', c.phone);
       await save(c);
@@ -408,16 +548,32 @@ async function openSocket(c) {
       if (code === DisconnectReason.loggedOut) {
         c.error = 'logged_out';
         note(c, 'logged_out');
-        await wipe(c, false);
+        await wipe(c, false, true);
         return;
       }
-      if (c.retries < MAX_RETRIES && c.auth) {
+      if (code === DisconnectReason.forbidden) {
+        c.state = 'idle';
+        c.error = 'restricted';
+        note(c, 'restricted');
+        if (c.job && c.job.running) c.job.block = true;
+        await save(c).catch(() => {});
+        return;
+      }
+      if (code === DisconnectReason.connectionReplaced) {
+        c.state = 'idle';
+        c.error = 'replaced';
+        note(c, 'replaced');
+        return;
+      }
+      const linked = !!(c.auth && c.auth.creds.me);
+      if (c.auth && (linked || c.retries < MAX_RETRIES)) {
         c.retries++;
         c.state = 'connecting';
         note(c, 'reconnect', null, c.retries);
+        const ms = code === DisconnectReason.restartRequired ? 500 : Math.min(2000 * c.retries, BACKOFF_MAX);
         setTimeout(() => {
           if (!c.sock && c.auth && clients.get(c.uid) === c && !c.manual) openSocket(c).catch(() => {});
-        }, Math.min(2000 * c.retries, 10000));
+        }, ms);
       } else {
         c.state = 'idle';
         c.error = 'failed';
@@ -449,14 +605,15 @@ async function start(c, mode) {
         note(c, 'expired');
         note(c, gone ? 'wiped' : 'wipe_retry');
       } else if (saved) {
-        c.auth = makeAuth(saved, () => saveSoon(c));
+        restoreExtra(c.uid, saved);
+        c.auth = makeAuth(saved, (slow) => saveSoon(c, slow));
         c.expiresAt = Number(r.expiresAt) || 0;
         note(c, 'resume');
       }
     }
     if (!c.auth) {
       if (mode !== 'new') return;
-      c.auth = makeAuth(null, () => saveSoon(c));
+      c.auth = makeAuth(null, (slow) => saveSoon(c, slow));
       c.expiresAt = 0;
     }
   }
@@ -465,8 +622,21 @@ async function start(c, mode) {
   await openSocket(c);
 }
 
+function spin(text) {
+  let out = text;
+  for (let k = 0; k < 4; k++) {
+    const next = out.replace(/\{([^{}]*\|[^{}]*)\}/g, (m, body) => {
+      const parts = body.split('|');
+      return parts[Math.floor(Math.random() * parts.length)];
+    });
+    if (next === out) break;
+    out = next;
+  }
+  return out;
+}
+
 function fill(template, defs, values) {
-  return template.replace(/\{\{([1-6])\}\}/g, (m, n) => {
+  return spin(template).replace(/\{\{([1-6])\}\}/g, (m, n) => {
     const i = Number(n) - 1;
     const v = values && typeof values[i] === 'string' && values[i] !== '' ? values[i] : defs[i];
     return typeof v === 'string' ? v : '';
@@ -477,7 +647,7 @@ function wait(job, ms) {
   return new Promise((resolve) => {
     const end = Date.now() + ms;
     const tick = () => {
-      if (job.stop || Date.now() >= end) resolve();
+      if (job.stop || job.block || Date.now() >= end) resolve();
       else setTimeout(tick, Math.min(500, end - Date.now()));
     };
     tick();
@@ -485,55 +655,174 @@ function wait(job, ms) {
 }
 
 async function ready(c, job) {
-  const end = Date.now() + 60000;
-  while (Date.now() < end) {
-    if (job.stop) return false;
-    if (c.state === 'open' && c.sock) return true;
-    if (!c.auth) return false;
+  if (c.state === 'open' && c.sock) return true;
+  const end = Date.now() + PAUSE_MS;
+  job.paused = true;
+  note(c, 'paused');
+  while (Date.now() < end && !job.stop && !job.block) {
+    active(c);
+    if (c.state === 'open' && c.sock) {
+      job.paused = false;
+      note(c, 'resumed', null, job.done);
+      return true;
+    }
+    if (c.error === 'restricted' || c.error === 'replaced') break;
     await wait(job, 1000);
   }
+  job.paused = false;
   return false;
+}
+
+function pick(r) {
+  return r[0] + Math.floor(Math.random() * (r[1] - r[0]));
+}
+
+async function typeLike(c, jid, text) {
+  try {
+    await c.sock.sendPresenceUpdate('composing', jid);
+    await new Promise((r) => setTimeout(r, Math.min(9000, 2000 + text.length * 45 + Math.floor(Math.random() * 1500))));
+    await c.sock.sendPresenceUpdate('paused', jid);
+    await new Promise((r) => setTimeout(r, 300 + Math.floor(Math.random() * 900)));
+  } catch (e) {}
+}
+
+function skipRest(job, from, total) {
+  for (let k = from; k < total; k++) push(job, k, 'k');
 }
 
 async function runJob(c, job, input) {
   const range = SPEEDS[input.speed] || SPEEDS.safe;
+  const hourCap = HOUR_CAPS[input.speed] || HOUR_CAPS.safe;
+  let streak = 0;
+  let nextRest = pick(REST_EVERY);
+  let rateHits = 0;
+  let badRun = 0;
+  let checked = 0;
+  let invalid = 0;
+  const stamps = [];
+  const settle = SETTLE_MS - (Date.now() - c.openAt);
+  if (settle > 0) {
+    note(c, 'settle', null, Math.ceil(settle / 1000));
+    await wait(job, settle);
+  }
   for (let i = 0; i < input.rows.length; i++) {
     if (job.stop) break;
     active(c);
+    if (job.block) {
+      skipRest(job, i, input.rows.length);
+      return;
+    }
     if (!(await ready(c, job))) {
       if (job.stop) break;
-      note(c, 'lost');
-      for (let k = i; k < input.rows.length; k++) push(job, k, 'f');
+      note(c, job.block || c.error === 'restricted' ? 'restricted_stop' : 'lost');
+      skipRest(job, i, input.rows.length);
+      return;
+    }
+    if (job.sent >= input.dayLeft) {
+      note(c, 'day_cap', null, DAY_CAP);
+      skipRest(job, i, input.rows.length);
       return;
     }
     const row = input.rows[i];
     let status = 'f';
+    let retry = false;
     let why = null;
     try {
       const hits = await c.sock.onWhatsApp(row.p);
       const hit = hits && hits[0];
-      if (!hit || !hit.exists) status = 'n';
-      else {
-        await c.sock.sendMessage(hit.jid, { text: fill(input.template, input.defs, row.v) });
+      checked++;
+      if (!hit || !hit.exists) {
+        status = 'n';
+        invalid++;
+      } else {
+        const text = fill(input.template, input.defs, row.v);
+        await typeLike(c, hit.jid, text);
+        if (job.stop || !c.sock) throw new Error('connection closed');
+        const sent = await c.sock.sendMessage(hit.jid, { text });
+        remember(c.uid, sent);
+        if (sent && sent.key && sent.key.id) job.ids.add(sent.key.id);
+        saveSoon(c, true);
         status = 's';
+        c.sentAt = Date.now();
+        stamps.push(Date.now());
       }
     } catch (e) {
       status = 'f';
       why = reason(e);
+      if (why === 'conn' && (row.t || 0) < 3 && !job.stop) {
+        row.t = (row.t || 0) + 1;
+        retry = true;
+      }
+    }
+    if (why === 'blocked') {
+      job.block = true;
+      c.error = 'restricted';
+      note(c, 'restricted_stop');
+      skipRest(job, i, input.rows.length);
+      return;
+    }
+    if (why === 'rate' && !job.stop) {
+      rateHits++;
+      if (rateHits >= 2) {
+        note(c, 'rate_stop');
+        skipRest(job, i, input.rows.length);
+        return;
+      }
+      note(c, 'rate_pause', null, Math.round(RATE_PAUSE_MS / 60000));
+      await wait(job, RATE_PAUSE_MS);
+      i--;
+      continue;
+    }
+    if (retry) {
+      await wait(job, 3000);
+      i--;
+      continue;
     }
     push(job, i, status);
     note(c, status === 's' ? 'sent' : status === 'n' ? 'not_wa' : 'failed', row.p, why);
+    badRun = status === 'n' ? badRun + 1 : 0;
+    if (checked >= INVALID_MIN && invalid / checked > INVALID_RATIO) {
+      note(c, 'invalid_stop');
+      skipRest(job, i + 1, input.rows.length);
+      return;
+    }
     if (i < input.rows.length - 1 && !job.stop) {
-      const ms = range[0] + Math.floor(Math.random() * (range[1] - range[0]));
-      note(c, 'wait', null, Math.round(ms / 1000));
+      while (stamps.length && Date.now() - stamps[0] > 3600000) stamps.shift();
+      let ms;
+      if (status !== 's') {
+        ms = pick([4000, 9000]);
+        if (badRun >= INVALID_STREAK) {
+          badRun = 0;
+          ms = pick(INVALID_REST);
+          note(c, 'invalid_rest', null, Math.round(ms / 60000));
+        }
+        await wait(job, ms);
+        continue;
+      }
+      streak++;
+      ms = pick(range);
+      if (job.sent <= WARM_COUNT) ms = Math.round(ms * 1.5);
+      if (Math.random() < 0.1) ms = Math.round(ms * 2);
+      if (stamps.length >= hourCap) {
+        ms = Math.max(ms, 3600000 - (Date.now() - stamps[0]) + pick([20000, 90000]));
+        note(c, 'cap', null, [hourCap, Math.round(ms / 60000)]);
+      } else if (streak >= nextRest) {
+        streak = 0;
+        nextRest = pick(REST_EVERY);
+        ms = pick(REST_MS);
+        note(c, 'rest', null, Math.round(ms / 60000));
+      } else note(c, 'wait', null, Math.round(ms / 1000));
       await wait(job, ms);
     }
   }
 }
 
 function reason(e) {
-  const code = e && e.output ? e.output.statusCode : 0;
+  const code = e && e.output ? e.output.statusCode : Number(e && (e.status || e.code)) || 0;
+  const data = e && e.data && (e.data.attrs || e.data);
+  const ack = data ? Number(data.code || data.error) || 0 : 0;
   const m = String((e && e.message) || '').toLowerCase();
+  if (BLOCK_CODES.has(code) || BLOCK_CODES.has(ack) || m.includes('restrict') || m.includes('forbidden') || m.includes('banned')) return 'blocked';
   if (code === 429 || m.includes('rate')) return 'rate';
   if (m.includes('timed out') || m.includes('timeout')) return 'timeout';
   if (m.includes('closed') || m.includes('connection')) return 'conn';
@@ -545,6 +834,7 @@ function push(job, i, status) {
   job.done++;
   if (status === 's') job.sent++;
   else if (status === 'n') job.invalid++;
+  else if (status === 'k') job.skipped++;
   else job.failed++;
 }
 
@@ -555,11 +845,12 @@ function cleanInput(b) {
   if (defs.length > 6 || defs.some((d) => typeof d !== 'string' || d.length > MAX_VALUE)) return null;
   const rows = Array.isArray(b.rows) ? b.rows : [];
   if (!rows.length || rows.length > MAX_ROWS) return null;
+  const used = Number.isInteger(b.dayUsed) && b.dayUsed >= 0 ? Math.min(b.dayUsed, DAY_CAP) : 0;
   for (const r of rows) {
     if (!r || typeof r.p !== 'string' || !PHONE_RE.test(r.p)) return null;
     if (!Array.isArray(r.v) || r.v.length > 6 || r.v.some((x) => typeof x !== 'string' || x.length > MAX_VALUE)) return null;
   }
-  return { template, defs, rows: rows.map((r) => ({ p: r.p, v: r.v })), speed: b.speed === 'normal' ? 'normal' : 'safe' };
+  return { template, defs, rows: rows.map((r) => ({ p: r.p, v: r.v })), speed: b.speed === 'normal' ? 'normal' : 'safe', dayLeft: DAY_CAP - used };
 }
 
 function view(c, from, lf) {
@@ -580,8 +871,11 @@ function view(c, from, lf) {
           sent: j.sent,
           invalid: j.invalid,
           failed: j.failed,
+          skipped: j.skipped,
+          delivered: j.delivered,
           running: j.running,
           stopped: j.stop,
+          paused: !!j.paused,
           results: j.results.slice(Math.max(0, Number(from) || 0))
         }
       : null
@@ -641,7 +935,8 @@ setInterval(() => {
       wipe(c, true).catch(() => {});
       continue;
     }
-    if (now - c.seen > IDLE_MS) {
+    const holding = linked && c.sock && now - c.sentAt < HOLD_MS;
+    if (now - c.seen > IDLE_MS && !holding) {
       c.manual = true;
       const s = c.sock;
       c.sock = null;
@@ -743,10 +1038,11 @@ app.post('/connect', async (req, res) => {
 app.post('/send', (req, res) => {
   const c = clients.get(req.body.uid);
   if (c) active(c);
-  if (!c || c.state !== 'open' || !c.sock) return res.status(409).json({ ok: false, error: 'not_open' });
+  if (!c || c.state !== 'open' || !c.sock) return res.status(409).json({ ok: false, error: c && c.error === 'restricted' ? 'restricted' : 'not_open' });
   if (c.job && c.job.running) return res.status(409).json({ ok: false, error: 'job_running' });
   const input = cleanInput(req.body);
   if (!input) return res.status(400).json({ ok: false, error: 'bad' });
+  if (input.dayLeft <= 0) return res.status(429).json({ ok: false, error: 'day_cap' });
   const job = {
     id: crypto.randomUUID(),
     total: input.rows.length,
@@ -754,8 +1050,14 @@ app.post('/send', (req, res) => {
     sent: 0,
     invalid: 0,
     failed: 0,
+    skipped: 0,
+    delivered: 0,
+    ids: new Set(),
+    got: new Set(),
+    block: false,
     results: [],
     running: true,
+    paused: false,
     stop: false
   };
   c.job = job;
@@ -764,7 +1066,8 @@ app.post('/send', (req, res) => {
     .catch(() => {})
     .finally(() => {
       job.running = false;
-      note(c, job.stop ? 'stopped' : 'done', null, [job.sent, job.invalid, job.failed]);
+      note(c, job.stop ? 'stopped' : 'done', null, [job.sent, job.invalid, job.failed + job.skipped]);
+      save(c).catch(() => {});
     });
   res.json(view(c, 0, req.body.lf));
 });
