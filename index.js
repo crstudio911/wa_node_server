@@ -14,7 +14,7 @@ const {
 } = require('@whiskeysockets/baileys');
 
 const SETTINGS = {
-  BRIDGE_KEY: 'wA!9x_kP$7mQ#vL2*zR#8bN$4fY@6hC%1jT',
+  BRIDGE_KEY: '',
   WORKER_URL: 'https://pop-api-1.uuuuouuuuuuouuu.workers.dev'
 };
 
@@ -30,7 +30,7 @@ const QR_LIMIT = 5;
 const MAX_RETRIES = 6;
 const BACKOFF_MAX = 60 * 1000;
 const PAUSE_MS = 30 * 60 * 1000;
-const MAX_ROWS = 500;
+const MAX_ROWS = 5000;
 const MAX_TEXT = 4096;
 const MAX_VALUE = 300;
 const UID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
@@ -38,6 +38,7 @@ const PHONE_RE = /^\d{8,15}$/;
 const SPEEDS = { safe: [30000, 65000], normal: [18000, 40000] };
 const HOUR_CAPS = { safe: 30, normal: 45 };
 const DAY_CAP = 150;
+const DAY_MAX = 100000;
 const REST_EVERY = [8, 15];
 const REST_MS = [5 * 60 * 1000, 11 * 60 * 1000];
 const RATE_PAUSE_MS = 20 * 60 * 1000;
@@ -297,7 +298,7 @@ function getClient(uid) {
 }
 
 function note(c, k, p, x) {
-  if (!c) return;
+  if (!c || c.erased) return;
   c.logSeq++;
   c.log.push({ n: c.logSeq, t: Date.now(), k, p: p || null, x: x === undefined ? null : x });
   if (c.log.length > LOG_MAX) c.log.splice(0, c.log.length - LOG_MAX);
@@ -326,7 +327,7 @@ function busy(c) {
 }
 
 async function touch(c, at) {
-  if (!c.auth || !c.auth.creds.me) return;
+  if (c.erased || !c.auth || !c.auth.creds.me) return;
   c.touchedAt = Date.now();
   try {
     const r = await worker('/bridge/session/touch', { uid: c.uid, at });
@@ -352,7 +353,7 @@ async function save(c) {
   clearTimeout(c.saveTimer);
   c.saveTimer = null;
   c.saveAt = 0;
-  if (!c.auth || !c.auth.creds.me) return;
+  if (c.erased || !c.auth || !c.auth.creds.me) return;
   let data = '';
   for (let level = 0; level < 3; level++) {
     data = seal(snapshot(c, level));
@@ -376,7 +377,7 @@ async function save(c) {
 }
 
 function saveSoon(c, slow) {
-  if (!c.auth || !c.auth.creds.me) return;
+  if (c.erased || !c.auth || !c.auth.creds.me) return;
   const at = Date.now() + (slow ? SAVE_SLOW_MS : SAVE_FAST_MS);
   if (c.saveTimer && c.saveAt <= at) return;
   clearTimeout(c.saveTimer);
@@ -719,7 +720,7 @@ async function runJob(c, job, input) {
       return;
     }
     if (job.sent >= input.dayLeft) {
-      note(c, 'day_cap', null, DAY_CAP);
+      note(c, 'day_cap', null, input.dayCap);
       skipRest(job, i, input.rows.length);
       return;
     }
@@ -845,12 +846,13 @@ function cleanInput(b) {
   if (defs.length > 6 || defs.some((d) => typeof d !== 'string' || d.length > MAX_VALUE)) return null;
   const rows = Array.isArray(b.rows) ? b.rows : [];
   if (!rows.length || rows.length > MAX_ROWS) return null;
-  const used = Number.isInteger(b.dayUsed) && b.dayUsed >= 0 ? Math.min(b.dayUsed, DAY_CAP) : 0;
+  const cap = Number.isInteger(b.dayCap) && b.dayCap >= 0 ? (b.dayCap === 0 ? DAY_MAX : Math.min(b.dayCap, DAY_MAX)) : DAY_CAP;
+  const used = Number.isInteger(b.dayUsed) && b.dayUsed >= 0 ? Math.min(b.dayUsed, cap) : 0;
   for (const r of rows) {
     if (!r || typeof r.p !== 'string' || !PHONE_RE.test(r.p)) return null;
     if (!Array.isArray(r.v) || r.v.length > 6 || r.v.some((x) => typeof x !== 'string' || x.length > MAX_VALUE)) return null;
   }
-  return { template, defs, rows: rows.map((r) => ({ p: r.p, v: r.v })), speed: b.speed === 'normal' ? 'normal' : 'safe', dayLeft: DAY_CAP - used };
+  return { template, defs, rows: rows.map((r) => ({ p: r.p, v: r.v })), speed: b.speed === 'normal' ? 'normal' : 'safe', dayCap: cap, dayLeft: cap - used };
 }
 
 function view(c, from, lf) {
@@ -963,7 +965,7 @@ setInterval(() => {
   for (const [n, at] of nonces) if (now - at > LINK_SKEW_MS * 2) nonces.delete(n);
 }, 30000).unref();
 
-const ROUTES = new Set(['/status', '/connect', '/send', '/stop', '/logout']);
+const ROUTES = new Set(['/health', '/status', '/connect', '/send', '/stop', '/logout']);
 
 function deny(req, res) {
   req.socket.destroy();
@@ -988,7 +990,7 @@ app.use((req, res, next) => {
   next();
 });
 
-app.use(express.json({ limit: '1mb', strict: true }));
+app.use(express.json({ limit: '6mb', strict: true }));
 
 app.use((err, req, res, next) => {
   deny(req, res);
@@ -1010,6 +1012,10 @@ app.use((req, res, next) => {
   const send = res.json.bind(res);
   res.json = (obj) => send({ d: lock(obj, aad) });
   next();
+});
+
+app.post('/health', (req, res) => {
+  res.json({ ok: true, clients: clients.size });
 });
 
 app.post('/status', (req, res) => {
@@ -1062,10 +1068,18 @@ app.post('/send', (req, res) => {
   };
   c.job = job;
   note(c, 'start', null, job.total);
-  runJob(c, job, input)
+  c.runningJob = runJob(c, job, input)
     .catch(() => {})
     .finally(() => {
       job.running = false;
+      if (c.erased) {
+        input.rows.length = 0;
+        input.defs.length = 0;
+        input.template = '';
+        job.results.length = 0;
+        job.ids.clear();
+        job.got.clear();
+      }
       note(c, job.stop ? 'stopped' : 'done', null, [job.sent, job.invalid, job.failed + job.skipped]);
       save(c).catch(() => {});
     });
@@ -1083,8 +1097,9 @@ app.post('/stop', (req, res) => {
 
 app.post('/logout', async (req, res) => {
   const c = getClient(req.body.uid);
+  if (req.body.purge === true) c.erased = true;
   try {
-    if (c.auth) {
+    if (c.auth || (req.body.purge === true && c.sock)) {
       await wipe(c, true);
     } else {
       const r = await worker('/bridge/session/get', { uid: c.uid });
@@ -1098,6 +1113,23 @@ app.post('/logout', async (req, res) => {
     }
   } catch (e) {
     return res.status(502).json({ ok: false, error: 'unavailable' });
+  }
+  if (req.body.purge === true) {
+    if (!await dropSaved(c.uid)) return res.status(502).json({ ok: false, error: 'unavailable' });
+    if (c.job) c.job.stop = true;
+    if (c.runningJob) await c.runningJob.catch(() => {});
+    c.erased = true;
+    if (c.job) { c.job.stop = true; c.job.results.length = 0; c.job.ids.clear(); }
+    clearTimeout(c.saveTimer);
+    c.auth = null;
+    c.qr = null;
+    c.phone = null;
+    c.log.length = 0;
+    c.job = null;
+    pending.delete(c.uid);
+    outbox.delete(c.uid);
+    clients.delete(c.uid);
+    return res.json({ ok: true, deleted: true });
   }
   c.error = null;
   res.json(view(c, 0, req.body.lf));
