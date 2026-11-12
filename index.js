@@ -14,7 +14,7 @@ const {
 } = require('@whiskeysockets/baileys');
 
 const SETTINGS = {
-  BRIDGE_KEY: '',
+  BRIDGE_KEY: 'wA!9x_kP$7mQ#vL2*zR#8bN$4fY@6hC%1jT@ffS7oka',
   WORKER_URL: 'https://pop-api-1.uuuuouuuuuuouuu.workers.dev'
 };
 
